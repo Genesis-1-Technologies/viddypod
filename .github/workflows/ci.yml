@@ -40,6 +40,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: viddypod-desktop/package-lock.json
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -59,6 +65,16 @@ jobs:
           curl -L -o viddypod-desktop/src-tauri/binaries/yt-dlp-x86_64-unknown-linux-gnu \
             https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux
           chmod +x viddypod-desktop/src-tauri/binaries/yt-dlp-x86_64-unknown-linux-gnu
+
+      # generate_context! resolves frontendDist ("../dist") at compile time and
+      # hard-errors if it is missing. dist/ is gitignored, and the
+      # beforeBuildCommand that would produce it only runs under `tauri build`
+      # — so cargo test has to build the frontend itself.
+      - name: Build frontend
+        working-directory: viddypod-desktop
+        run: |
+          npm ci
+          npm run build
 
       - name: cargo test
         working-directory: viddypod-desktop/src-tauri

@@ -3,6 +3,7 @@ use crate::state::AppState;
 use crate::uploader;
 use crate::SERVER_URL;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
@@ -16,9 +17,17 @@ struct PendingAsset {
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// Consecutive failures before we tell the server to stop handing an asset
+/// back. Transient errors deserve a retry; a permanently-broken video would
+/// otherwise be re-downloaded every 15s forever.
+const MAX_ATTEMPTS: u32 = 3;
 
 pub async fn run_poller(app: AppHandle, state: Arc<Mutex<AppState>>) {
     log::info!("Poller started");
+
+    // Consecutive failures per asset id. In-memory on purpose — restarting the
+    // app is a reasonable "try again".
+    let mut attempts: HashMap<String, u32> = HashMap::new();
 
     loop {
         let token = {
@@ -48,12 +57,23 @@ pub async fn run_poller(app: AppHandle, state: Arc<Mutex<AppState>>) {
 
                             match process_one(&app, &token, &asset.id, &video_id).await {
                                 Ok(title) => {
+                                    attempts.remove(&asset.id);
                                     let mut s = state.lock().await;
                                     s.add_download(title, "Uploaded".to_string());
                                     s.processing = false;
                                 }
                                 Err(e) => {
-                                    log::error!("Failed to process {}: {}", video_id, e);
+                                    let n = attempts.entry(asset.id.clone()).or_insert(0);
+                                    *n += 1;
+                                    let n = *n;
+                                    log::error!(
+                                        "Failed to process {} (attempt {}/{}): {}",
+                                        video_id, n, MAX_ATTEMPTS, e
+                                    );
+                                    if n >= MAX_ATTEMPTS {
+                                        report_failure(&token, &asset.id, &e.to_string()).await;
+                                        attempts.remove(&asset.id);
+                                    }
                                     let mut s = state.lock().await;
                                     s.add_download(video_id.clone(), format!("Failed: {}", e));
                                     s.processing = false;
@@ -92,6 +112,36 @@ async fn fetch_pending(token: &str) -> anyhow::Result<Vec<PendingAsset>> {
     }
     let assets: Vec<PendingAsset> = res.json().await?;
     Ok(assets)
+}
+
+/// Tell the server this asset can't be downloaded so it stops being returned by
+/// /agent/pending. Best-effort — on error we just retry next cycle.
+async fn report_failure(token: &str, asset_id: &str, error: &str) {
+    let url = format!("{}/api/v1/agent/failed/{}", SERVER_URL, asset_id);
+    let truncated: String = error.chars().take(500).collect();
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Could not build client to report failure: {}", e);
+            return;
+        }
+    };
+    match client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "error": truncated }))
+        .send()
+        .await
+    {
+        Ok(res) if res.status().is_success() => {
+            log::info!("Reported {} as failed", asset_id);
+        }
+        Ok(res) => log::warn!("Failed to report {}: HTTP {}", asset_id, res.status()),
+        Err(e) => log::warn!("Failed to report {}: {}", asset_id, e),
+    }
 }
 
 async fn process_one(

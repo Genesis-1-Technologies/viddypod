@@ -42,6 +42,29 @@ function prompt(question) {
   });
 }
 
+/// Same as prompt() but suppresses echo, so the password never lands in the
+/// terminal scrollback or a screen share.
+function promptSecret(question) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  return new Promise((resolve) => {
+    const onData = (char) => {
+      // Stop muting once the line is submitted
+      if (['\n', '\r', ''].includes(char.toString())) {
+        process.stdin.removeListener('data', onData);
+      } else {
+        process.stdout.write('\x1b[2K\x1b[200D' + `  ${question} `);
+      }
+    };
+    process.stdin.on('data', onData);
+    rl.question(`  ${question} `, (answer) => {
+      process.stdin.removeListener('data', onData);
+      rl.close();
+      process.stdout.write('\n');
+      resolve(answer.trim());
+    });
+  });
+}
+
 async function commandExists(cmd) {
   try {
     if (isWindows) {
@@ -199,8 +222,10 @@ async function loadConfig() {
 }
 
 async function saveConfig(config) {
-  await mkdir(configDir, { recursive: true });
-  await writeFile(configPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+  // This file holds the account password in plaintext, so keep it owner-only.
+  // Default umask would leave it 0644 — readable by every user on the box.
+  await mkdir(configDir, { recursive: true, mode: 0o700 });
+  await writeFile(configPath, JSON.stringify(config, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
 }
 
 async function configureAgent(detectedBrowser) {
@@ -214,7 +239,7 @@ async function configureAgent(detectedBrowser) {
   const email = await prompt(`Email [${config.email || ''}]:`);
   config.email = email || config.email;
 
-  const password = await prompt(`Password:`);
+  const password = await promptSecret(`Password (hidden):`);
   if (password) config.password = password;
 
   const browser = await prompt(`Browser for cookies [${detectedBrowser || config.browser || 'chrome'}]:`);
@@ -314,30 +339,22 @@ async function main() {
 
   // Step 4: Show how to run
   header('Setup Complete!');
-  log('Run the agent with:\n');
-
-  if (isWindows) {
-    log(`  node agent\\vid2pod-agent.mjs ^`);
-    log(`    --server ${config.server} ^`);
-    log(`    --email ${config.email} ^`);
-    log(`    --password YOUR_PASSWORD`);
-  } else {
-    log(`  node agent/vid2pod-agent.mjs \\`);
-    log(`    --server ${config.server} \\`);
-    log(`    --email ${config.email} \\`);
-    log(`    --password YOUR_PASSWORD`);
-  }
-
+  log('Your credentials are saved, so just run:\n');
+  log(isWindows ? `  node agent\\vid2pod-agent.mjs` : `  node agent/vid2pod-agent.mjs`);
   log('');
-  log('Or use your saved config:\n');
-  log(`  VID2POD_SERVER=${config.server} \\`);
-  log(`  VID2POD_EMAIL=${config.email} \\`);
-  log(`  VID2POD_PASSWORD=YOUR_PASSWORD \\`);
-  log(`  node agent/vid2pod-agent.mjs`);
+  log(`Config: ${configPath} (owner-only)`);
+  log('');
+  warn('Avoid --password on the command line — it leaks into shell history and `ps`.');
 
   if (isWindows) {
     log('');
-    warn('Windows note: Close Chrome before first run so yt-dlp can read cookies');
+    warn('Windows + Chrome 127 or newer: yt-dlp cannot read Chrome cookies at all.');
+    log('  App-Bound encryption blocks it even with Chrome closed (yt-dlp#10927).');
+    log('  Export a cookies.txt with a browser extension and point the agent at it:');
+    log('');
+    log('    node agent\\vid2pod-agent.mjs --cookies C:\\path\\to\\cookies.txt');
+    log('');
+    log('  Or run the ViddyPod desktop app, which syncs cookies automatically.');
   }
 
   console.log('');

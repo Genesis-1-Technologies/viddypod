@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to the same PR makes the in-flight run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (typecheck + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      # tests/global-setup.ts supplies placeholder env vars and every test
+      # mocks the DB, queue and S3 — no Postgres/Redis/MinIO services needed.
+      - run: npm test
+
+  desktop:
+    name: Desktop agent (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: viddypod-desktop/src-tauri
+
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libsoup-3.0-dev
+
+      # tauri.conf.json declares binaries/yt-dlp as an externalBin and the
+      # sidecars are not committed, so generate_context! needs one present.
+      - name: Download yt-dlp sidecar
+        run: |
+          mkdir -p viddypod-desktop/src-tauri/binaries
+          curl -L -o viddypod-desktop/src-tauri/binaries/yt-dlp-x86_64-unknown-linux-gnu \
+            https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux
+          chmod +x viddypod-desktop/src-tauri/binaries/yt-dlp-x86_64-unknown-linux-gnu
+
+      - name: cargo test
+        working-directory: viddypod-desktop/src-tauri
+        run: cargo test

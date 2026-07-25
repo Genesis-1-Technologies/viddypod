@@ -6,7 +6,13 @@
 const AGENT_URL = 'http://127.0.0.1:17421';
 const DOMAINS = ['.youtube.com', '.google.com', '.googlevideo.com'];
 const DEBOUNCE_MS = 3000;
-const HEARTBEAT_MINUTES = 10;
+// Chrome clamps alarm periods to >= 1 min for packed extensions. The desktop
+// app marks us disconnected after 3 min of silence, so 1 min survives a couple
+// of missed wakeups.
+const HEARTBEAT_MINUTES = 1;
+// Cookies rarely change; a full re-push every 10 min is enough on top of the
+// change-triggered pushes.
+const COOKIE_REPUSH_MS = 10 * 60 * 1000;
 
 let debounceHandle = null;
 
@@ -92,16 +98,21 @@ chrome.cookies.onChanged.addListener((info) => {
   }, DEBOUNCE_MS);
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create('heartbeat', { periodInMinutes: HEARTBEAT_MINUTES });
-});
-
-chrome.runtime.onStartup.addListener(() => {
-  chrome.alarms.create('heartbeat', { periodInMinutes: HEARTBEAT_MINUTES });
-});
+// Re-arm on every service-worker start, not just install/startup — MV3 workers
+// are torn down and revived constantly, and a lost alarm would silently end the
+// heartbeat. create() on an existing alarm is a no-op reset, so this is safe.
+chrome.alarms.create('heartbeat', { periodInMinutes: HEARTBEAT_MINUTES });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'heartbeat') pushCookies();
+  if (alarm.name !== 'heartbeat') return;
+  (async () => {
+    // The ping is what keeps the desktop app's "connected" light on; it is
+    // cheap enough to run every minute.
+    await ping();
+    const { lastSync } = await chrome.storage.local.get(['lastSync']);
+    const staleSince = lastSync && lastSync.ok ? Date.parse(lastSync.at) : 0;
+    if (Date.now() - staleSince >= COOKIE_REPUSH_MS) await pushCookies();
+  })();
 });
 
 // --- Messaging API (for popup) --------------------------------------------

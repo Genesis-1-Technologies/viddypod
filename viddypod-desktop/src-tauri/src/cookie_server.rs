@@ -4,9 +4,13 @@
 //
 // Security model:
 //  - Binds to 127.0.0.1 only (not reachable from the network)
-//  - Requires `Authorization: Bearer <pair_token>` on mutating endpoints
-//  - Origin header must begin with one of the allowed browser-extension
-//    schemes (chrome-extension://, moz-extension://, edge-extension://)
+//  - Requires `Authorization: Bearer <pair_token>` on every endpoint — this is
+//    the actual access control
+//  - If an Origin header is present it must be a browser-extension scheme, so a
+//    malicious web page can never reach us (a page fetch always carries its web
+//    origin). An *absent* Origin is allowed: Chrome omits it on privileged
+//    extension GETs, and forging one buys an attacker nothing they couldn't do
+//    with plain curl — which still needs the token.
 //  - cookies.txt is written atomically (write tmp → rename) and lives under
 //    the user's local app data dir, inheriting OS-level user-only permissions
 
@@ -143,19 +147,12 @@ async fn auth_and_origin_middleware(
         return Ok(next.run(req).await);
     }
 
-    // Origin must be a browser extension
-    let origin_ok = req
+    let origin = req
         .headers()
         .get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            s.starts_with("chrome-extension://")
-                || s.starts_with("moz-extension://")
-                || s.starts_with("edge-extension://")
-        })
-        .unwrap_or(false);
-    if !origin_ok {
-        log::warn!("[cookie_server] rejected: bad or missing Origin");
+        .and_then(|v| v.to_str().ok());
+    if !origin_allowed(origin) {
+        log::warn!("[cookie_server] rejected: non-extension Origin {:?}", origin);
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -171,7 +168,24 @@ async fn auth_and_origin_middleware(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    // Any authenticated request proves the extension is alive — record it here
+    // rather than in a handler so /ping counts too.
+    state.app_state.lock().await.last_extension_seen = Some(chrono::Utc::now());
+
     Ok(next.run(req).await)
+}
+
+/// An absent Origin is allowed (privileged extension GETs omit it); a present
+/// one must be a browser extension, which keeps web pages out.
+fn origin_allowed(origin: Option<&str>) -> bool {
+    match origin {
+        None => true,
+        Some(o) => {
+            o.starts_with("chrome-extension://")
+                || o.starts_with("moz-extension://")
+                || o.starts_with("edge-extension://")
+        }
+    }
 }
 
 async fn handle_ping() -> Json<PingResponse> {
@@ -261,5 +275,17 @@ mod tests {
         }];
         let out = to_netscape(&cookies);
         assert!(out.contains("youtube.com\tFALSE\t/\tFALSE\t0\tx\ty"));
+    }
+
+    #[test]
+    fn origin_policy_keeps_pages_out_but_allows_absent_origin() {
+        // Chrome omits Origin on privileged extension GETs (e.g. /ping)
+        assert!(origin_allowed(None));
+        assert!(origin_allowed(Some("chrome-extension://abcdef")));
+        assert!(origin_allowed(Some("moz-extension://abcdef")));
+        // A web page fetch always carries its own origin — reject it
+        assert!(!origin_allowed(Some("https://evil.example")));
+        assert!(!origin_allowed(Some("http://127.0.0.1:3000")));
+        assert!(!origin_allowed(Some("null")));
     }
 }

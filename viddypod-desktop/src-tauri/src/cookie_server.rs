@@ -110,6 +110,18 @@ pub async fn run_cookie_server(
         cookies_path,
     };
 
+    let app = build_router(state);
+
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    log::info!("[cookie_server] listening on {}", addr);
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Router plus its full middleware stack. Split out so tests can drive it
+/// directly instead of binding a port.
+fn build_router(state: ServerState) -> Router {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ORIGIN])
@@ -120,7 +132,7 @@ pub async fn run_cookie_server(
                 || bytes.starts_with(b"edge-extension://")
         }));
 
-    let app = Router::new()
+    Router::new()
         .route("/ping", get(handle_ping))
         .route("/cookies", post(handle_cookies))
         .layer(middleware::from_fn_with_state(
@@ -128,13 +140,7 @@ pub async fn run_cookie_server(
             auth_and_origin_middleware,
         ))
         .layer(cors)
-        .with_state(state);
-
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    log::info!("[cookie_server] listening on {}", addr);
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(state)
 }
 
 async fn auth_and_origin_middleware(
@@ -275,6 +281,142 @@ mod tests {
         }];
         let out = to_netscape(&cookies);
         assert!(out.contains("youtube.com\tFALSE\t/\tFALSE\t0\tx\ty"));
+    }
+
+    // --- Router-level tests -------------------------------------------------
+    //
+    // These drive the real router through its full middleware stack. The
+    // reported "Extension not connected" bug lived here: GET /ping carries no
+    // Origin header from a privileged Chrome extension request, and the old
+    // middleware rejected it with 403.
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    fn test_state() -> (ServerState, Arc<Mutex<AppState>>, tempdir::Dir) {
+        let dir = tempdir::Dir::new();
+        let app_state = Arc::new(Mutex::new(AppState::new()));
+        let state = ServerState {
+            app_state: app_state.clone(),
+            pair_token: TOKEN.to_string(),
+            cookies_path: dir.path().join("cookies.txt"),
+        };
+        (state, app_state, dir)
+    }
+
+    /// Minimal scoped temp dir so tests never write into the real app data dir.
+    mod tempdir {
+        use std::path::{Path, PathBuf};
+        pub struct Dir(PathBuf);
+        impl Dir {
+            pub fn new() -> Self {
+                let base = std::env::temp_dir().join(format!(
+                    "viddypod-test-{}-{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                std::fs::create_dir_all(&base).unwrap();
+                Dir(base)
+            }
+            pub fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_without_origin_is_allowed_and_marks_extension_connected() {
+        let (state, app_state, _dir) = test_state();
+        let res = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/ping")
+                    .header("Authorization", format!("Bearer {}", TOKEN))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Regression: this was 403 because the middleware required an Origin
+        // header that Chrome does not send on privileged extension GETs.
+        assert_eq!(res.status(), StatusCode::OK);
+        // And the ping alone must be enough to light up the desktop UI —
+        // liveness previously depended on cookie pushes only.
+        assert!(app_state.lock().await.to_status().extension_connected);
+    }
+
+    #[tokio::test]
+    async fn ping_from_a_web_page_origin_is_rejected() {
+        let (state, _app_state, _dir) = test_state();
+        let res = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/ping")
+                    .header("Authorization", format!("Bearer {}", TOKEN))
+                    .header("Origin", "https://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ping_with_wrong_token_is_unauthorized_and_does_not_mark_connected() {
+        let (state, app_state, _dir) = test_state();
+        let res = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/ping")
+                    .header("Authorization", "Bearer deadbeefdeadbeefdeadbeefdeadbeef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(!app_state.lock().await.to_status().extension_connected);
+    }
+
+    #[tokio::test]
+    async fn cookie_push_from_extension_origin_writes_netscape_file() {
+        let (state, app_state, dir) = test_state();
+        let body = serde_json::json!({
+            "cookies": [{
+                "name": "SID", "value": "abc123", "domain": ".youtube.com",
+                "path": "/", "expirationDate": 1_800_000_000.0,
+                "secure": true, "httpOnly": true, "session": false
+            }]
+        });
+
+        let res = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cookies")
+                    .header("Authorization", format!("Bearer {}", TOKEN))
+                    .header("Origin", "chrome-extension://abcdefghijklmnop")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let written = std::fs::read_to_string(dir.path().join("cookies.txt")).unwrap();
+        assert!(written.contains(".youtube.com\tTRUE\t/\tTRUE\t1800000000\tSID\tabc123"));
+        assert_eq!(app_state.lock().await.cookie_count, 1);
     }
 
     #[test]

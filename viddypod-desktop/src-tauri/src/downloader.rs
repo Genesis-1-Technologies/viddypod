@@ -147,6 +147,24 @@ async fn run_yt_dlp(
     let work_dir = std::env::temp_dir().join(format!("viddypod-{}", unique_id()));
     std::fs::create_dir_all(&work_dir)?;
 
+    // The caller only cleans up on success, so every failure path in here would
+    // otherwise orphan the temp dir — one per attempt, forever, for any video
+    // YouTube keeps refusing.
+    match run_yt_dlp_in(app, video_id, cookies_file, &work_dir).await {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work_dir);
+            Err(e)
+        }
+    }
+}
+
+async fn run_yt_dlp_in(
+    app: &AppHandle,
+    video_id: &str,
+    cookies_file: Option<&Path>,
+    work_dir: &Path,
+) -> Result<DownloadResult> {
     let output_template = work_dir
         .join("%(id)s.%(ext)s")
         .to_string_lossy()
@@ -224,7 +242,7 @@ async fn run_yt_dlp(
     // Find the output mp3 and info.json
     let mut audio_path = None;
     let mut info_path = None;
-    for entry in std::fs::read_dir(&work_dir)? {
+    for entry in std::fs::read_dir(work_dir)? {
         let entry = entry?;
         let path = entry.path();
         if let Some(ext) = path.extension() {
@@ -263,7 +281,7 @@ async fn run_yt_dlp(
 
     Ok(DownloadResult {
         audio_path,
-        work_dir,
+        work_dir: work_dir.to_path_buf(),
         metadata,
     })
 }

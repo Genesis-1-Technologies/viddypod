@@ -34,6 +34,11 @@ tower-http = { version = "0.5", features = ["cors"] }
 rand = "0.8"
 subtle = "2.6"
 
+[dev-dependencies]
+# ServiceExt::oneshot lets the cookie-server tests drive the real router
+# through its full middleware stack without binding a port.
+tower = { version = "0.4", features = ["util"] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

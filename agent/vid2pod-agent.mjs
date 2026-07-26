@@ -21,9 +21,7 @@ import { promisify } from 'util';
 import { readFile, readdir, mkdir, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
-import { platform } from 'os';
 import { randomUUID } from 'crypto';
-import { createReadStream } from 'fs';
 
 const execFileAsync = promisify(execFile);
 
@@ -46,7 +44,10 @@ const EMAIL = getArg('email') || process.env.VID2POD_EMAIL || savedConfig.email;
 const PASSWORD = getArg('password') || process.env.VID2POD_PASSWORD || savedConfig.password;
 const POLL_INTERVAL = parseInt(getArg('interval') || process.env.VID2POD_POLL_INTERVAL || savedConfig.interval || '30', 10) * 1000;
 const BROWSER = getArg('browser') || process.env.VID2POD_BROWSER || savedConfig.browser || 'chrome';
-const DOWNLOAD_DIR = getArg('download-dir') || process.env.VID2POD_DOWNLOAD_DIR || join(homedir(), 'Vid2Pod');
+// Explicit Netscape cookies.txt. Preferred over --cookies-from-browser, which
+// cannot read Chrome cookies on Windows since Chrome 127 introduced App-Bound
+// encryption (yt-dlp#10927). Export one with a cookies.txt browser extension.
+const COOKIES_FILE = getArg('cookies') || process.env.VID2POD_COOKIES || savedConfig.cookies || null;
 
 if (!EMAIL || !PASSWORD) {
   console.error('Usage: vid2pod-agent --server URL --email EMAIL --password PASSWORD');
@@ -73,7 +74,7 @@ async function login() {
   log('Logged in', { email: EMAIL });
 }
 
-async function apiFetch(path, options = {}) {
+async function apiFetch(path, options = {}, retryOnAuthFail = true) {
   const res = await fetch(`${SERVER}${path}`, {
     ...options,
     headers: {
@@ -81,18 +82,35 @@ async function apiFetch(path, options = {}) {
       'Authorization': `Bearer ${token}`,
     },
   });
-  if (res.status === 401) {
-    // Token expired, re-login
+  // Re-login once on 401. Without the flag a permanently-rejected credential
+  // (revoked user, clock skew) recurses forever, hammering /auth/login.
+  if (res.status === 401 && retryOnAuthFail) {
     await login();
-    return apiFetch(path, options);
+    return apiFetch(path, options, false);
   }
   return res;
 }
 
 async function getPendingDownloads() {
   const res = await apiFetch('/api/v1/agent/pending');
-  if (!res.ok) return [];
+  // Don't mask server errors as "nothing to do" — the poll loop logs these.
+  if (!res.ok) throw new Error(`Cannot fetch pending downloads: HTTP ${res.status}`);
   return res.json();
+}
+
+/// Tell the server a download can never succeed, so it stops being handed back
+/// on every poll. Best-effort: a failure here just means we retry next cycle.
+async function reportFailure(assetId, message) {
+  try {
+    const res = await apiFetch(`/api/v1/agent/failed/${assetId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ error: String(message).slice(0, 500) }),
+    });
+    if (!res.ok) log('Could not report failure', { assetId, status: res.status });
+  } catch (err) {
+    log('Could not report failure', { assetId, error: err.message });
+  }
 }
 
 async function downloadAudio(videoId) {
@@ -115,7 +133,7 @@ async function downloadAudio(videoId) {
     '--js-runtimes', 'deno',
     '--js-runtimes', 'node',
     '--remote-components', 'ejs:github',
-    '--cookies-from-browser', BROWSER,
+    ...(COOKIES_FILE ? ['--cookies', COOKIES_FILE] : ['--cookies-from-browser', BROWSER]),
     `https://www.youtube.com/watch?v=${videoId}`,
   ], {
     cwd: workDir,
@@ -138,9 +156,6 @@ async function downloadAudio(videoId) {
       thumbnail: raw.thumbnail || null,
     };
   }
-
-  // Also save to local download dir for reference
-  await mkdir(DOWNLOAD_DIR, { recursive: true });
 
   const audioPath = join(workDir, audioFile);
   log('Downloaded', { videoId, title: metadata.title, duration: metadata.duration });
@@ -179,6 +194,13 @@ async function uploadAudio(assetId, audioPath, metadata) {
   return result;
 }
 
+// Per-asset attempt counter. Transient failures (network blip, YouTube hiccup)
+// deserve a retry; a video that fails MAX_ATTEMPTS times in a row is reported
+// failed so the server stops handing it back forever. In-memory on purpose —
+// a restart is a reasonable "try again".
+const attempts = new Map();
+const MAX_ATTEMPTS = 3;
+
 async function processOne(asset) {
   const videoId = asset.youtubeVideoId;
   if (!videoId) {
@@ -191,8 +213,16 @@ async function processOne(asset) {
     await uploadAudio(asset.id, audioPath, metadata);
     // Cleanup temp dir
     await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    attempts.delete(asset.id);
   } catch (err) {
-    log('Failed', { videoId, error: err.message });
+    const n = (attempts.get(asset.id) || 0) + 1;
+    attempts.set(asset.id, n);
+    log('Failed', { videoId, attempt: `${n}/${MAX_ATTEMPTS}`, error: err.message });
+    if (n >= MAX_ATTEMPTS) {
+      log('Giving up, marking failed', { videoId });
+      await reportFailure(asset.id, err.message);
+      attempts.delete(asset.id);
+    }
   }
 }
 
@@ -215,9 +245,8 @@ async function main() {
   console.log('');
   console.log('  Vid2Pod Local Agent');
   console.log(`  Server:   ${SERVER}`);
-  console.log(`  Browser:  ${BROWSER}`);
+  console.log(`  Cookies:  ${COOKIES_FILE ? COOKIES_FILE : `${BROWSER} (browser)`}`);
   console.log(`  Interval: ${POLL_INTERVAL / 1000}s`);
-  console.log(`  Downloads: ${DOWNLOAD_DIR}`);
   console.log('');
 
   await login();

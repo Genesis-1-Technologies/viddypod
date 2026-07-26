@@ -10,7 +10,16 @@ pub struct AppState {
     pub pair_token: String,
     pub cookie_count: usize,
     pub last_cookie_sync: Option<DateTime<Utc>>,
+    /// Last authenticated request from the extension (ping *or* cookie push).
+    /// Liveness must not be inferred from cookie pushes alone — those only
+    /// happen when cookies actually change.
+    pub last_extension_seen: Option<DateTime<Utc>>,
 }
+
+/// How long after the last authenticated extension request we still consider it
+/// connected. Must stay comfortably above the extension's heartbeat period
+/// (1 min) so a single missed alarm doesn't flap the UI.
+const EXTENSION_STALE_AFTER_SECS: i64 = 180;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RecentDownload {
@@ -37,11 +46,9 @@ impl AppState {
     }
 
     pub fn to_status(&self) -> Status {
-        // Extension is considered "connected" if we've received a cookie push
-        // within the last 5 minutes.
         let extension_connected = self
-            .last_cookie_sync
-            .map(|t| (Utc::now() - t).num_seconds() < 300)
+            .last_extension_seen
+            .map(|t| (Utc::now() - t).num_seconds() < EXTENSION_STALE_AFTER_SECS)
             .unwrap_or(false);
         Status {
             signed_in: self.token.is_some(),

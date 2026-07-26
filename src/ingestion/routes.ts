@@ -15,6 +15,11 @@ const cookiesSchema = z.object({
   cookies: z.string().min(1),
 });
 
+const agentFailureSchema = z.object({
+  // Truncated: this is attacker-influenced text (yt-dlp stderr) that lands in logs
+  error: z.string().max(500).optional(),
+});
+
 const addStreamSchema = z.object({
   licenseId: z.string().uuid(),
   streamUrl: z.string().url(),
@@ -143,6 +148,47 @@ export async function ingestionRoutes(app: FastifyInstance) {
     });
 
     return reply.status(200).send({ ok: true, status: 'processing' });
+  });
+
+  // Agent reports a download it cannot complete. Without this, a video that can
+  // never succeed (private, removed, age-gated, region-blocked) stays
+  // 'pending_download' forever and every agent re-downloads it on every poll —
+  // an unbounded retry loop against YouTube from the user's own IP.
+  app.post('/api/v1/agent/failed/:assetId', {
+    preHandler: [authMiddleware],
+  }, async (request, reply) => {
+    // Validate before it reaches Postgres — a non-UUID would raise
+    // "invalid input syntax for type uuid" and surface as a 500.
+    const assetId = z.string().uuid().parse((request.params as { assetId: string }).assetId);
+    const { error } = agentFailureSchema.parse(request.body ?? {});
+
+    const db = (await import('../db/client.js')).getDb();
+    const { assets } = await import('../db/schema.js');
+    const { eq, and } = await import('drizzle-orm');
+
+    const result = await db.update(assets)
+      .set({
+        processingStatus: 'failed',
+        processingStage: 'failed',
+        updatedAt: new Date(),
+      })
+      // Scoped to the caller's own pending-download assets: an agent must not
+      // be able to fail someone else's asset, or clobber one already processing.
+      .where(and(
+        eq(assets.id, assetId),
+        eq(assets.userId, request.userId!),
+        eq(assets.processingStatus, 'pending_download'),
+      ))
+      .returning({ id: assets.id });
+
+    if (result.length === 0) {
+      throw new (await import('../shared/errors.js')).NotFoundError('Pending asset');
+    }
+
+    // Episodes carry no status of their own — EpisodeList reads the asset's
+    // processingStatus/processingStage through the join, so this is enough.
+    request.log.warn({ assetId, error }, 'Agent reported download failure');
+    return reply.status(200).send({ ok: true, status: 'failed' });
   });
 
   // Re-host episode thumbnails from YouTube to our S3

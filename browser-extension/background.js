@@ -6,7 +6,13 @@
 const AGENT_URL = 'http://127.0.0.1:17421';
 const DOMAINS = ['.youtube.com', '.google.com', '.googlevideo.com'];
 const DEBOUNCE_MS = 3000;
-const HEARTBEAT_MINUTES = 10;
+// Chrome clamps alarm periods to >= 1 min for packed extensions. The desktop
+// app marks us disconnected after 3 min of silence, so 1 min survives a couple
+// of missed wakeups.
+const HEARTBEAT_MINUTES = 1;
+// Cookies rarely change; a full re-push every 10 min is enough on top of the
+// change-triggered pushes.
+const COOKIE_REPUSH_MS = 10 * 60 * 1000;
 
 let debounceHandle = null;
 
@@ -92,16 +98,27 @@ chrome.cookies.onChanged.addListener((info) => {
   }, DEBOUNCE_MS);
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create('heartbeat', { periodInMinutes: HEARTBEAT_MINUTES });
-});
-
-chrome.runtime.onStartup.addListener(() => {
-  chrome.alarms.create('heartbeat', { periodInMinutes: HEARTBEAT_MINUTES });
+// Alarms survive service-worker teardown, so this only needs to cover the
+// cases where one is genuinely absent: first install, browser restart, or an
+// extension reload. It must be a get-then-create — calling create() outright
+// REPLACES an existing alarm and restarts its countdown, and this file's top
+// level re-runs on every worker wake-up (cookies.onChanged fires constantly
+// while browsing YouTube). An unconditional create() there would push the
+// heartbeat out by a minute on every cookie change and starve it entirely.
+chrome.alarms.get('heartbeat', (existing) => {
+  if (!existing) chrome.alarms.create('heartbeat', { periodInMinutes: HEARTBEAT_MINUTES });
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'heartbeat') pushCookies();
+  if (alarm.name !== 'heartbeat') return;
+  (async () => {
+    // The ping is what keeps the desktop app's "connected" light on; it is
+    // cheap enough to run every minute.
+    await ping();
+    const { lastSync } = await chrome.storage.local.get(['lastSync']);
+    const staleSince = lastSync && lastSync.ok ? Date.parse(lastSync.at) : 0;
+    if (Date.now() - staleSince >= COOKIE_REPUSH_MS) await pushCookies();
+  })();
 });
 
 // --- Messaging API (for popup) --------------------------------------------

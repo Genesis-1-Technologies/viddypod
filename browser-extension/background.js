@@ -98,10 +98,16 @@ chrome.cookies.onChanged.addListener((info) => {
   }, DEBOUNCE_MS);
 });
 
-// Re-arm on every service-worker start, not just install/startup — MV3 workers
-// are torn down and revived constantly, and a lost alarm would silently end the
-// heartbeat. create() on an existing alarm is a no-op reset, so this is safe.
-chrome.alarms.create('heartbeat', { periodInMinutes: HEARTBEAT_MINUTES });
+// Alarms survive service-worker teardown, so this only needs to cover the
+// cases where one is genuinely absent: first install, browser restart, or an
+// extension reload. It must be a get-then-create — calling create() outright
+// REPLACES an existing alarm and restarts its countdown, and this file's top
+// level re-runs on every worker wake-up (cookies.onChanged fires constantly
+// while browsing YouTube). An unconditional create() there would push the
+// heartbeat out by a minute on every cookie change and starve it entirely.
+chrome.alarms.get('heartbeat', (existing) => {
+  if (!existing) chrome.alarms.create('heartbeat', { periodInMinutes: HEARTBEAT_MINUTES });
+});
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== 'heartbeat') return;

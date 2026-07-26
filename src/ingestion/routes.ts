@@ -157,7 +157,9 @@ export async function ingestionRoutes(app: FastifyInstance) {
   app.post('/api/v1/agent/failed/:assetId', {
     preHandler: [authMiddleware],
   }, async (request, reply) => {
-    const { assetId } = request.params as { assetId: string };
+    // Validate before it reaches Postgres — a non-UUID would raise
+    // "invalid input syntax for type uuid" and surface as a 500.
+    const assetId = z.string().uuid().parse((request.params as { assetId: string }).assetId);
     const { error } = agentFailureSchema.parse(request.body ?? {});
 
     const db = (await import('../db/client.js')).getDb();

@@ -112,6 +112,17 @@ describe('POST /api/v1/agent/failed/:assetId', () => {
     expect(res.statusCode).toBe(200);
   });
 
+  test('rejects a non-UUID assetId with 400 rather than a Postgres 500', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/agent/failed/not-a-uuid',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { error: 'boom' },
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+
   test('rejects an oversized error string rather than logging it', async () => {
     const res = await app.inject({
       method: 'POST',
